@@ -9,7 +9,9 @@ from django.contrib.staticfiles.finders import get_finder, get_finders
 from django.contrib.staticfiles.storage import staticfiles_storage
 from django.core.exceptions import ImproperlyConfigured
 from django.core.files.storage import default_storage
-from django.db import connection, connections, models, router
+from django.db import (
+    IntegrityError, connection, connections, models, router, transaction,
+)
 from django.forms import EmailField, IntegerField
 from django.http import HttpResponse
 from django.template.loader import render_to_string
@@ -226,7 +228,8 @@ class AssertNumQueriesUponConnectionTests(TransactionTestCase):
             if is_opening_connection:
                 # Avoid infinite recursion. Creating a cursor calls
                 # ensure_connection() which is currently mocked by this method.
-                connection.cursor().execute('SELECT 1' + connection.features.bare_select_suffix)
+                with connection.cursor() as cursor:
+                    cursor.execute('SELECT 1' + connection.features.bare_select_suffix)
 
         ensure_connection = 'django.db.backends.base.base.BaseDatabaseWrapper.ensure_connection'
         with mock.patch(ensure_connection, side_effect=make_configuration_query):
@@ -373,13 +376,13 @@ class AssertNumQueriesContextManagerTests(TestCase):
             Person.objects.count()
 
     def test_failure(self):
-        with self.assertRaises(AssertionError) as exc_info:
+        msg = (
+            '1 != 2 : 1 queries executed, 2 expected\nCaptured queries were:\n'
+            '1.'
+        )
+        with self.assertRaisesMessage(AssertionError, msg):
             with self.assertNumQueries(2):
                 Person.objects.count()
-        exc_lines = str(exc_info.exception).split('\n')
-        self.assertEqual(exc_lines[0], '1 != 2 : 1 queries executed, 2 expected')
-        self.assertEqual(exc_lines[1], 'Captured queries were:')
-        self.assertTrue(exc_lines[2].startswith('1.'))  # queries are numbered
 
         with self.assertRaises(TypeError):
             with self.assertNumQueries(4000):
@@ -537,22 +540,25 @@ class HTMLEqualTests(SimpleTestCase):
         self.assertEqual(dom.children[0], "<p>foo</p> '</scr'+'ipt>' <span>bar</span>")
 
     def test_self_closing_tags(self):
-        self_closing_tags = (
-            'br', 'hr', 'input', 'img', 'meta', 'spacer', 'link', 'frame',
-            'base', 'col',
-        )
+        self_closing_tags = [
+            'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link',
+            'meta', 'param', 'source', 'track', 'wbr',
+            # Deprecated tags
+            'frame', 'spacer',
+        ]
         for tag in self_closing_tags:
-            dom = parse_html('<p>Hello <%s> world</p>' % tag)
-            self.assertEqual(len(dom.children), 3)
-            self.assertEqual(dom[0], 'Hello')
-            self.assertEqual(dom[1].name, tag)
-            self.assertEqual(dom[2], 'world')
+            with self.subTest(tag):
+                dom = parse_html('<p>Hello <%s> world</p>' % tag)
+                self.assertEqual(len(dom.children), 3)
+                self.assertEqual(dom[0], 'Hello')
+                self.assertEqual(dom[1].name, tag)
+                self.assertEqual(dom[2], 'world')
 
-            dom = parse_html('<p>Hello <%s /> world</p>' % tag)
-            self.assertEqual(len(dom.children), 3)
-            self.assertEqual(dom[0], 'Hello')
-            self.assertEqual(dom[1].name, tag)
-            self.assertEqual(dom[2], 'world')
+                dom = parse_html('<p>Hello <%s /> world</p>' % tag)
+                self.assertEqual(len(dom.children), 3)
+                self.assertEqual(dom[0], 'Hello')
+                self.assertEqual(dom[1].name, tag)
+                self.assertEqual(dom[2], 'world')
 
     def test_simple_equal_html(self):
         self.assertHTMLEqual('', '')
@@ -611,6 +617,45 @@ class HTMLEqualTests(SimpleTestCase):
         self.assertHTMLNotEqual(
             '<input type="text" id="id_name" />',
             '<input type="password" id="id_name" />')
+
+    def test_class_attribute(self):
+        pairs = [
+            ('<p class="foo bar"></p>', '<p class="bar foo"></p>'),
+            ('<p class=" foo bar "></p>', '<p class="bar foo"></p>'),
+            ('<p class="   foo    bar    "></p>', '<p class="bar foo"></p>'),
+            ('<p class="foo\tbar"></p>', '<p class="bar foo"></p>'),
+            ('<p class="\tfoo\tbar\t"></p>', '<p class="bar foo"></p>'),
+            ('<p class="\t\t\tfoo\t\t\tbar\t\t\t"></p>', '<p class="bar foo"></p>'),
+            ('<p class="\t \nfoo \t\nbar\n\t "></p>', '<p class="bar foo"></p>'),
+        ]
+        for html1, html2 in pairs:
+            with self.subTest(html1):
+                self.assertHTMLEqual(html1, html2)
+
+    def test_normalize_refs(self):
+        pairs = [
+            ('&#39;', '&#x27;'),
+            ('&#39;', "'"),
+            ('&#x27;', '&#39;'),
+            ('&#x27;', "'"),
+            ("'", '&#39;'),
+            ("'", '&#x27;'),
+            ('&amp;', '&#38;'),
+            ('&amp;', '&#x26;'),
+            ('&amp;', '&'),
+            ('&#38;', '&amp;'),
+            ('&#38;', '&#x26;'),
+            ('&#38;', '&'),
+            ('&#x26;', '&amp;'),
+            ('&#x26;', '&#38;'),
+            ('&#x26;', '&'),
+            ('&', '&amp;'),
+            ('&', '&#38;'),
+            ('&', '&#x26;'),
+        ]
+        for pair in pairs:
+            with self.subTest(repr(pair)):
+                self.assertHTMLEqual(*pair)
 
     def test_complex_examples(self):
         self.assertHTMLEqual(
@@ -723,10 +768,29 @@ class HTMLEqualTests(SimpleTestCase):
         dom2 = parse_html('<p>foo<p>bar</p></p>')
         self.assertEqual(dom2.count(dom1), 0)
 
-        # html with a root element contains the same html with no root element
+        # HTML with a root element contains the same HTML with no root element.
         dom1 = parse_html('<p>foo</p><p>bar</p>')
         dom2 = parse_html('<div><p>foo</p><p>bar</p></div>')
         self.assertEqual(dom2.count(dom1), 1)
+
+        # Target of search is a sequence of child elements and appears more
+        # than once.
+        dom2 = parse_html('<div><p>foo</p><p>bar</p><p>foo</p><p>bar</p></div>')
+        self.assertEqual(dom2.count(dom1), 2)
+
+        # Searched HTML has additional children.
+        dom1 = parse_html('<a/><b/>')
+        dom2 = parse_html('<a/><b/><c/>')
+        self.assertEqual(dom2.count(dom1), 1)
+
+        # No match found in children.
+        dom1 = parse_html('<b/><a/>')
+        self.assertEqual(dom2.count(dom1), 0)
+
+        # Target of search found among children and grandchildren.
+        dom1 = parse_html('<b/><b/>')
+        dom2 = parse_html('<a><b/><b/></a><b/><b/>')
+        self.assertEqual(dom2.count(dom1), 2)
 
     def test_parsing_errors(self):
         with self.assertRaises(AssertionError):
@@ -763,10 +827,10 @@ class HTMLEqualTests(SimpleTestCase):
             self.assertContains(response, '<p "whats" that>')
 
     def test_unicode_handling(self):
-        response = HttpResponse('<p class="help">Some help text for the title (with unicode ŠĐĆŽćžšđ)</p>')
+        response = HttpResponse('<p class="help">Some help text for the title (with Unicode ŠĐĆŽćžšđ)</p>')
         self.assertContains(
             response,
-            '<p class="help">Some help text for the title (with unicode ŠĐĆŽćžšđ)</p>',
+            '<p class="help">Some help text for the title (with Unicode ŠĐĆŽćžšđ)</p>',
             html=True
         )
 
@@ -877,6 +941,26 @@ class XMLEqualTests(SimpleTestCase):
         xml1 = "<elem>foo</elem><elem>bar</elem>"
         xml2 = "<elem>foo</elem> <elem>bar</elem>"
         self.assertXMLNotEqual(xml1, xml2)
+
+    def test_doctype_root(self):
+        xml1 = '<?xml version="1.0"?><!DOCTYPE root SYSTEM "example1.dtd"><root />'
+        xml2 = '<?xml version="1.0"?><!DOCTYPE root SYSTEM "example2.dtd"><root />'
+        self.assertXMLEqual(xml1, xml2)
+
+    def test_processing_instruction(self):
+        xml1 = (
+            '<?xml version="1.0"?>'
+            '<?xml-model href="http://www.example1.com"?><root />'
+        )
+        xml2 = (
+            '<?xml version="1.0"?>'
+            '<?xml-model href="http://www.example2.com"?><root />'
+        )
+        self.assertXMLEqual(xml1, xml2)
+        self.assertXMLEqual(
+            '<?xml-stylesheet href="style1.xslt" type="text/xsl"?><root />',
+            '<?xml-stylesheet href="style2.xslt" type="text/xsl"?><root />',
+        )
 
 
 class SkippingExtraTests(TestCase):
@@ -1210,6 +1294,71 @@ class TestBadSetUpTestData(TestCase):
         self.assertFalse(self._in_atomic_block)
 
 
+class CaptureOnCommitCallbacksTests(TestCase):
+    databases = {'default', 'other'}
+    callback_called = False
+
+    def enqueue_callback(self, using='default'):
+        def hook():
+            self.callback_called = True
+
+        transaction.on_commit(hook, using=using)
+
+    def test_no_arguments(self):
+        with self.captureOnCommitCallbacks() as callbacks:
+            self.enqueue_callback()
+
+        self.assertEqual(len(callbacks), 1)
+        self.assertIs(self.callback_called, False)
+        callbacks[0]()
+        self.assertIs(self.callback_called, True)
+
+    def test_using(self):
+        with self.captureOnCommitCallbacks(using='other') as callbacks:
+            self.enqueue_callback(using='other')
+
+        self.assertEqual(len(callbacks), 1)
+        self.assertIs(self.callback_called, False)
+        callbacks[0]()
+        self.assertIs(self.callback_called, True)
+
+    def test_different_using(self):
+        with self.captureOnCommitCallbacks(using='default') as callbacks:
+            self.enqueue_callback(using='other')
+
+        self.assertEqual(callbacks, [])
+
+    def test_execute(self):
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            self.enqueue_callback()
+
+        self.assertEqual(len(callbacks), 1)
+        self.assertIs(self.callback_called, True)
+
+    def test_pre_callback(self):
+        def pre_hook():
+            pass
+
+        transaction.on_commit(pre_hook, using='default')
+        with self.captureOnCommitCallbacks() as callbacks:
+            self.enqueue_callback()
+
+        self.assertEqual(len(callbacks), 1)
+        self.assertNotEqual(callbacks[0], pre_hook)
+
+    def test_with_rolled_back_savepoint(self):
+        with self.captureOnCommitCallbacks() as callbacks:
+            try:
+                with transaction.atomic():
+                    self.enqueue_callback()
+                    raise IntegrityError
+            except IntegrityError:
+                # Inner transaction.atomic() has been rolled back.
+                pass
+
+        self.assertEqual(callbacks, [])
+
+
 class DisallowedDatabaseQueriesTests(SimpleTestCase):
     def test_disallowed_database_connections(self):
         expected_message = (
@@ -1347,4 +1496,27 @@ class TestContextDecoratorTests(SimpleTestCase):
         self.assertFalse(mock_disable.called)
         with self.assertRaisesMessage(NotImplementedError, 'reraised'):
             decorated_test_class.setUp()
+        decorated_test_class.doCleanups()
         self.assertTrue(mock_disable.called)
+
+    def test_cleanups_run_after_tearDown(self):
+        calls = []
+
+        class SaveCallsDecorator(TestContextDecorator):
+            def enable(self):
+                calls.append('enable')
+
+            def disable(self):
+                calls.append('disable')
+
+        class AddCleanupInSetUp(unittest.TestCase):
+            def setUp(self):
+                calls.append('setUp')
+                self.addCleanup(lambda: calls.append('cleanup'))
+
+        decorator = SaveCallsDecorator()
+        decorated_test_class = decorator.__call__(AddCleanupInSetUp)()
+        decorated_test_class.setUp()
+        decorated_test_class.tearDown()
+        decorated_test_class.doCleanups()
+        self.assertEqual(calls, ['enable', 'setUp', 'cleanup', 'disable'])

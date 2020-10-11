@@ -1,13 +1,17 @@
 """Compare two HTML documents."""
 
-import re
 from html.parser import HTMLParser
 
-WHITESPACE = re.compile(r'\s+')
+from django.utils.regex_helper import _lazy_re_compile
+
+# ASCII whitespace is U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, or U+0020
+# SPACE.
+# https://infra.spec.whatwg.org/#ascii-whitespace
+ASCII_WHITESPACE = _lazy_re_compile(r'[\t\n\f\r ]+')
 
 
 def normalize_whitespace(string):
-    return WHITESPACE.sub(' ', string)
+    return ASCII_WHITESPACE.sub(' ', string)
 
 
 class Element:
@@ -82,6 +86,7 @@ class Element:
             if self.children == element.children:
                 return 1
         i = 0
+        elem_child_idx = 0
         for child in self.children:
             # child is text content and element is also text content, then
             # make a simple "text" in "text"
@@ -92,9 +97,26 @@ class Element:
                     elif element in child:
                         return 1
             else:
+                # Look for element wholly within this child.
                 i += child._count(element, count=count)
                 if not count and i:
                     return i
+                # Also look for a sequence of element's children among self's
+                # children. self.children == element.children is tested above,
+                # but will fail if self has additional children. Ex: '<a/><b/>'
+                # is contained in '<a/><b/><c/>'.
+                if isinstance(element, RootElement) and element.children:
+                    elem_child = element.children[elem_child_idx]
+                    # Start or continue match, advance index.
+                    if elem_child == child:
+                        elem_child_idx += 1
+                        # Match found, reset index.
+                        if elem_child_idx == len(element.children):
+                            i += 1
+                            elem_child_idx = 0
+                    # No match, reset index.
+                    else:
+                        elem_child_idx = 0
         return i
 
     def __contains__(self, element):
@@ -138,13 +160,16 @@ class HTMLParseError(Exception):
 
 
 class Parser(HTMLParser):
-    SELF_CLOSING_TAGS = (
-        'br', 'hr', 'input', 'img', 'meta', 'spacer', 'link', 'frame', 'base',
-        'col',
-    )
+    # https://html.spec.whatwg.org/#void-elements
+    SELF_CLOSING_TAGS = {
+        'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta',
+        'param', 'source', 'track', 'wbr',
+        # Deprecated tags
+        'frame', 'spacer',
+    }
 
     def __init__(self):
-        super().__init__(convert_charrefs=False)
+        super().__init__()
         self.root = RootElement()
         self.open_tags = []
         self.element_positions = {}
@@ -177,7 +202,7 @@ class Parser(HTMLParser):
         # Special case handling of 'class' attribute, so that comparisons of DOM
         # instances are not sensitive to ordering of classes.
         attrs = [
-            (name, " ".join(sorted(value.split(" "))))
+            (name, ' '.join(sorted(value for value in ASCII_WHITESPACE.split(value) if value)))
             if name == "class"
             else (name, value)
             for name, value in attrs
@@ -201,12 +226,6 @@ class Parser(HTMLParser):
 
     def handle_data(self, data):
         self.current.append(data)
-
-    def handle_charref(self, name):
-        self.current.append('&%s;' % name)
-
-    def handle_entityref(self, name):
-        self.current.append('&%s;' % name)
 
 
 def parse_html(html):

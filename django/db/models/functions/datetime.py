@@ -73,6 +73,14 @@ class Extract(TimezoneMixin, Transform):
             raise ValueError(
                 "Cannot extract time component '%s' from DateField '%s'. " % (copy.lookup_name, field.name)
             )
+        if (
+            isinstance(field, DurationField) and
+            copy.lookup_name in ('year', 'iso_year', 'month', 'week', 'week_day', 'iso_week_day', 'quarter')
+        ):
+            raise ValueError(
+                "Cannot extract component '%s' from DurationField '%s'."
+                % (copy.lookup_name, field.name)
+            )
         return copy
 
 
@@ -110,6 +118,11 @@ class ExtractWeekDay(Extract):
     lookup_name = 'week_day'
 
 
+class ExtractIsoWeekDay(Extract):
+    """Return Monday=1 through Sunday=7, based on ISO-8601."""
+    lookup_name = 'iso_week_day'
+
+
 class ExtractQuarter(Extract):
     lookup_name = 'quarter'
 
@@ -130,6 +143,7 @@ DateField.register_lookup(ExtractYear)
 DateField.register_lookup(ExtractMonth)
 DateField.register_lookup(ExtractDay)
 DateField.register_lookup(ExtractWeekDay)
+DateField.register_lookup(ExtractIsoWeekDay)
 DateField.register_lookup(ExtractWeek)
 DateField.register_lookup(ExtractIsoYear)
 DateField.register_lookup(ExtractQuarter)
@@ -278,7 +292,7 @@ class TruncDate(TruncBase):
     def as_sql(self, compiler, connection):
         # Cast to date rather than truncate to date.
         lhs, lhs_params = compiler.compile(self.lhs)
-        tzname = timezone.get_current_timezone_name() if settings.USE_TZ else None
+        tzname = self.get_tzname()
         sql = connection.ops.datetime_cast_date_sql(lhs, tzname)
         return sql, lhs_params
 
@@ -291,7 +305,7 @@ class TruncTime(TruncBase):
     def as_sql(self, compiler, connection):
         # Cast to time rather than truncate to time.
         lhs, lhs_params = compiler.compile(self.lhs)
-        tzname = timezone.get_current_timezone_name() if settings.USE_TZ else None
+        tzname = self.get_tzname()
         sql = connection.ops.datetime_cast_time_sql(lhs, tzname)
         return sql, lhs_params
 

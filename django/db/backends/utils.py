@@ -3,12 +3,10 @@ import decimal
 import functools
 import hashlib
 import logging
+import time
 from contextlib import contextmanager
-from time import time
 
-from django.conf import settings
-from django.db.utils import NotSupportedError
-from django.utils.timezone import utc
+from django.db import NotSupportedError
 
 logger = logging.getLogger('django.db.backends')
 
@@ -80,6 +78,7 @@ class CursorWrapper:
         self.db.validate_no_broken_transaction()
         with self.db.wrap_database_errors:
             if params is None:
+                # params default might be backend specific.
                 return self.cursor.execute(sql)
             else:
                 return self.cursor.execute(sql, params)
@@ -104,11 +103,11 @@ class CursorDebugWrapper(CursorWrapper):
 
     @contextmanager
     def debug_sql(self, sql=None, params=None, use_last_executed_query=False, many=False):
-        start = time()
+        start = time.monotonic()
         try:
             yield
         finally:
-            stop = time()
+            stop = time.monotonic()
             duration = stop - start
             if use_last_executed_query:
                 sql = self.db.ops.last_executed_query(self.cursor, sql, params)
@@ -169,11 +168,10 @@ def typecast_timestamp(s):  # does NOT store time zone information
         seconds, microseconds = seconds.split('.')
     else:
         microseconds = '0'
-    tzinfo = utc if settings.USE_TZ else None
     return datetime.datetime(
         int(dates[0]), int(dates[1]), int(dates[2]),
         int(times[0]), int(times[1]), int(seconds),
-        int((microseconds + '000000')[:6]), tzinfo
+        int((microseconds + '000000')[:6])
     )
 
 
@@ -183,7 +181,7 @@ def typecast_timestamp(s):  # does NOT store time zone information
 
 def split_identifier(identifier):
     """
-    Split a SQL identifier into a two element tuple of (namespace, name).
+    Split an SQL identifier into a two element tuple of (namespace, name).
 
     The identifier could be a table, column, or sequence name might be prefixed
     by a namespace.
@@ -197,7 +195,7 @@ def split_identifier(identifier):
 
 def truncate_name(identifier, length=None, hash_len=4):
     """
-    Shorten a SQL identifier to a repeatable mangled version with the given
+    Shorten an SQL identifier to a repeatable mangled version with the given
     length.
 
     If a quote stripped name contains a namespace, e.g. USERNAME"."TABLE,

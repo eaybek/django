@@ -82,6 +82,7 @@ class SyndicationFeedTest(FeedTestCase):
         self.assertEqual(len(feed_elem), 1)
         feed = feed_elem[0]
         self.assertEqual(feed.getAttribute('version'), '2.0')
+        self.assertEqual(feed.getElementsByTagName('language')[0].firstChild.nodeValue, 'en')
 
         # Making sure there's only one `channel` element w/in the
         # `rss` element.
@@ -135,10 +136,20 @@ class SyndicationFeedTest(FeedTestCase):
             'guid': 'http://example.com/blog/1/',
             'pubDate': pub_date,
             'author': 'test@example.com (Sally Smith)',
+            'comments': '/blog/1/comments',
         })
         self.assertCategories(items[0], ['python', 'testing'])
         for item in items:
-            self.assertChildNodes(item, ['title', 'link', 'description', 'guid', 'category', 'pubDate', 'author'])
+            self.assertChildNodes(item, [
+                'title',
+                'link',
+                'description',
+                'guid',
+                'category',
+                'pubDate',
+                'author',
+                'comments',
+            ])
             # Assert that <guid> does not have any 'isPermaLink' attribute
             self.assertIsNone(item.getElementsByTagName(
                 'guid')[0].attributes.get('isPermaLink'))
@@ -363,6 +374,11 @@ class SyndicationFeedTest(FeedTestCase):
             summary = entry.getElementsByTagName('summary')[0]
             self.assertEqual(summary.getAttribute('type'), 'html')
 
+    def test_feed_generator_language_attribute(self):
+        response = self.client.get('/syndication/language/')
+        feed = minidom.parseString(response.content).firstChild
+        self.assertEqual(feed.firstChild.getElementsByTagName('language')[0].firstChild.nodeValue, 'de')
+
     def test_title_escaping(self):
         """
         Titles are escaped correctly in RSS feeds.
@@ -405,14 +421,14 @@ class SyndicationFeedTest(FeedTestCase):
         Tests the Last-Modified header with naive publication dates.
         """
         response = self.client.get('/syndication/naive-dates/')
-        self.assertEqual(response['Last-Modified'], 'Tue, 26 Mar 2013 01:00:00 GMT')
+        self.assertEqual(response.headers['Last-Modified'], 'Tue, 26 Mar 2013 01:00:00 GMT')
 
     def test_feed_last_modified_time(self):
         """
         Tests the Last-Modified header with aware publication dates.
         """
         response = self.client.get('/syndication/aware-dates/')
-        self.assertEqual(response['Last-Modified'], 'Mon, 25 Mar 2013 19:18:00 GMT')
+        self.assertEqual(response.headers['Last-Modified'], 'Mon, 25 Mar 2013 19:18:00 GMT')
 
         # No last-modified when feed has no item_pubdate
         response = self.client.get('/syndication/no_pubdate/')

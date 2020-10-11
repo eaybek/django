@@ -1,5 +1,7 @@
+import operator
+
+from django.db import DatabaseError, NotSupportedError, connection
 from django.db.models import Exists, F, IntegerField, OuterRef, Value
-from django.db.utils import DatabaseError, NotSupportedError
 from django.test import TestCase, skipIfDBFeature, skipUnlessDBFeature
 
 from .models import Number, ReservedName
@@ -9,13 +11,10 @@ from .models import Number, ReservedName
 class QuerySetSetOperationTests(TestCase):
     @classmethod
     def setUpTestData(cls):
-        Number.objects.bulk_create(Number(num=i) for i in range(10))
-
-    def number_transform(self, value):
-        return value.num
+        Number.objects.bulk_create(Number(num=i, other_num=10 - i) for i in range(10))
 
     def assertNumbersEqual(self, queryset, expected_numbers, ordered=True):
-        self.assertQuerysetEqual(queryset, expected_numbers, self.number_transform, ordered)
+        self.assertQuerysetEqual(queryset, expected_numbers, operator.attrgetter('num'), ordered)
 
     def test_simple_union(self):
         qs1 = Number.objects.filter(num__lte=1)
@@ -51,6 +50,13 @@ class QuerySetSetOperationTests(TestCase):
         qs2 = Number.objects.all()
         self.assertEqual(len(list(qs1.union(qs2, all=True))), 20)
         self.assertEqual(len(list(qs1.union(qs2))), 10)
+
+    def test_union_none(self):
+        qs1 = Number.objects.filter(num__lte=1)
+        qs2 = Number.objects.filter(num__gte=8)
+        qs3 = qs1.union(qs2)
+        self.assertSequenceEqual(qs3.none(), [])
+        self.assertNumbersEqual(qs3, [0, 1, 8, 9], ordered=False)
 
     @skipUnlessDBFeature('supports_select_intersection')
     def test_intersection_with_empty_qs(self):
@@ -110,10 +116,34 @@ class QuerySetSetOperationTests(TestCase):
         qs2 = Number.objects.filter(num__gte=2, num__lte=3)
         self.assertNumbersEqual(qs1.union(qs2).order_by('-num'), [3, 2, 1, 0])
 
+    def test_ordering_by_alias(self):
+        qs1 = Number.objects.filter(num__lte=1).values(alias=F('num'))
+        qs2 = Number.objects.filter(num__gte=2, num__lte=3).values(alias=F('num'))
+        self.assertQuerysetEqual(
+            qs1.union(qs2).order_by('-alias'),
+            [3, 2, 1, 0],
+            operator.itemgetter('alias'),
+        )
+
     def test_ordering_by_f_expression(self):
         qs1 = Number.objects.filter(num__lte=1)
         qs2 = Number.objects.filter(num__gte=2, num__lte=3)
         self.assertNumbersEqual(qs1.union(qs2).order_by(F('num').desc()), [3, 2, 1, 0])
+
+    def test_ordering_by_f_expression_and_alias(self):
+        qs1 = Number.objects.filter(num__lte=1).values(alias=F('other_num'))
+        qs2 = Number.objects.filter(num__gte=2, num__lte=3).values(alias=F('other_num'))
+        self.assertQuerysetEqual(
+            qs1.union(qs2).order_by(F('alias').desc()),
+            [10, 9, 8, 7],
+            operator.itemgetter('alias'),
+        )
+        Number.objects.create(num=-1)
+        self.assertQuerysetEqual(
+            qs1.union(qs2).order_by(F('alias').desc(nulls_last=True)),
+            [10, 9, 8, 7, None],
+            operator.itemgetter('alias'),
+        )
 
     def test_union_with_values(self):
         ReservedName.objects.create(name='a', order=2)
@@ -123,6 +153,9 @@ class QuerySetSetOperationTests(TestCase):
         self.assertEqual(reserved_name['order'], 2)
         reserved_name = qs1.union(qs1).values_list('name', 'order', 'id').get()
         self.assertEqual(reserved_name[:2], ('a', 2))
+        # List of columns can be changed.
+        reserved_name = qs1.union(qs1).values_list('order').get()
+        self.assertEqual(reserved_name, (2,))
 
     def test_union_with_two_annotated_values_list(self):
         qs1 = Number.objects.filter(num=1).annotate(
@@ -150,6 +183,29 @@ class QuerySetSetOperationTests(TestCase):
         qs2 = Number.objects.filter(num=9)
         self.assertCountEqual(qs1.union(qs2).values_list('num', flat=True), [1, 9])
 
+    def test_union_with_values_list_and_order(self):
+        ReservedName.objects.bulk_create([
+            ReservedName(name='rn1', order=7),
+            ReservedName(name='rn2', order=5),
+            ReservedName(name='rn0', order=6),
+            ReservedName(name='rn9', order=-1),
+        ])
+        qs1 = ReservedName.objects.filter(order__gte=6)
+        qs2 = ReservedName.objects.filter(order__lte=5)
+        union_qs = qs1.union(qs2)
+        for qs, expected_result in (
+            # Order by a single column.
+            (union_qs.order_by('-pk').values_list('order', flat=True), [-1, 6, 5, 7]),
+            (union_qs.order_by('pk').values_list('order', flat=True), [7, 5, 6, -1]),
+            (union_qs.values_list('order', flat=True).order_by('-pk'), [-1, 6, 5, 7]),
+            (union_qs.values_list('order', flat=True).order_by('pk'), [7, 5, 6, -1]),
+            # Order by multiple columns.
+            (union_qs.order_by('-name', 'pk').values_list('order', flat=True), [-1, 5, 7, 6]),
+            (union_qs.values_list('order', flat=True).order_by('-name', 'pk'), [-1, 5, 7, 6]),
+        ):
+            with self.subTest(qs=qs):
+                self.assertEqual(list(qs), expected_result)
+
     def test_count_union(self):
         qs1 = Number.objects.filter(num__lte=1).values('num')
         qs2 = Number.objects.filter(num__gte=2, num__lte=3).values('num')
@@ -171,6 +227,22 @@ class QuerySetSetOperationTests(TestCase):
         qs2 = Number.objects.filter(num__lte=5)
         self.assertEqual(qs1.intersection(qs2).count(), 1)
 
+    def test_get_union(self):
+        qs = Number.objects.filter(num=2)
+        self.assertEqual(qs.union(qs).get().num, 2)
+
+    @skipUnlessDBFeature('supports_select_difference')
+    def test_get_difference(self):
+        qs1 = Number.objects.all()
+        qs2 = Number.objects.exclude(num=2)
+        self.assertEqual(qs1.difference(qs2).get().num, 2)
+
+    @skipUnlessDBFeature('supports_select_intersection')
+    def test_get_intersection(self):
+        qs1 = Number.objects.all()
+        qs2 = Number.objects.filter(num=2)
+        self.assertEqual(qs1.intersection(qs2).get().num, 2)
+
     @skipUnlessDBFeature('supports_slicing_ordering_in_compound')
     def test_ordering_subqueries(self):
         qs1 = Number.objects.order_by('num')[:2]
@@ -181,12 +253,15 @@ class QuerySetSetOperationTests(TestCase):
     def test_unsupported_ordering_slicing_raises_db_error(self):
         qs1 = Number.objects.all()
         qs2 = Number.objects.all()
+        qs3 = Number.objects.all()
         msg = 'LIMIT/OFFSET not allowed in subqueries of compound statements'
         with self.assertRaisesMessage(DatabaseError, msg):
             list(qs1.union(qs2[:10]))
         msg = 'ORDER BY not allowed in subqueries of compound statements'
         with self.assertRaisesMessage(DatabaseError, msg):
             list(qs1.order_by('id').union(qs2))
+        with self.assertRaisesMessage(DatabaseError, msg):
+            list(qs1.union(qs2).order_by('id').union(qs3))
 
     @skipIfDBFeature('supports_select_intersection')
     def test_unsupported_intersection_raises_db_error(self):
@@ -217,6 +292,10 @@ class QuerySetSetOperationTests(TestCase):
         # 'num' got realiased to num2
         with self.assertRaisesMessage(DatabaseError, msg):
             list(qs1.union(qs2).order_by('num'))
+        with self.assertRaisesMessage(DatabaseError, msg):
+            list(qs1.union(qs2).order_by(F('num')))
+        with self.assertRaisesMessage(DatabaseError, msg):
+            list(qs1.union(qs2).order_by(F('num').desc()))
         # switched order, now 'exists' again:
         list(qs2.union(qs1).order_by('num'))
 
@@ -225,3 +304,53 @@ class QuerySetSetOperationTests(TestCase):
         qs1 = Number.objects.all()
         qs2 = Number.objects.intersection(Number.objects.filter(num__gt=1))
         self.assertEqual(qs1.difference(qs2).count(), 2)
+
+    def test_order_by_same_type(self):
+        qs = Number.objects.all()
+        union = qs.union(qs)
+        numbers = list(range(10))
+        self.assertNumbersEqual(union.order_by('num'), numbers)
+        self.assertNumbersEqual(union.order_by('other_num'), reversed(numbers))
+
+    def test_unsupported_operations_on_combined_qs(self):
+        qs = Number.objects.all()
+        msg = 'Calling QuerySet.%s() after %s() is not supported.'
+        combinators = ['union']
+        if connection.features.supports_select_difference:
+            combinators.append('difference')
+        if connection.features.supports_select_intersection:
+            combinators.append('intersection')
+        for combinator in combinators:
+            for operation in (
+                'alias',
+                'annotate',
+                'defer',
+                'delete',
+                'distinct',
+                'exclude',
+                'extra',
+                'filter',
+                'only',
+                'prefetch_related',
+                'select_related',
+                'update',
+            ):
+                with self.subTest(combinator=combinator, operation=operation):
+                    with self.assertRaisesMessage(
+                        NotSupportedError,
+                        msg % (operation, combinator),
+                    ):
+                        getattr(getattr(qs, combinator)(qs), operation)()
+
+    def test_get_with_filters_unsupported_on_combined_qs(self):
+        qs = Number.objects.all()
+        msg = 'Calling QuerySet.get(...) with filters after %s() is not supported.'
+        combinators = ['union']
+        if connection.features.supports_select_difference:
+            combinators.append('difference')
+        if connection.features.supports_select_intersection:
+            combinators.append('intersection')
+        for combinator in combinators:
+            with self.subTest(combinator=combinator):
+                with self.assertRaisesMessage(NotSupportedError, msg % combinator):
+                    getattr(qs, combinator)(qs).get(num=2)
